@@ -241,16 +241,6 @@ This server uses the [Yandex.Disk REST API](https://yandex.ru/dev/disk/api/conce
 
 **API Endpoint:** `https://cloud-api.yandex.net/v1/disk`
 
-## Security
-
-⚠️ **Important Security Notes:**
-
-1. Never commit your OAuth token to git
-2. Store token in environment variables or secure files
-3. Limit OAuth application permissions to only what's needed
-4. Token expires after 1 year - you'll need to get a new one
-5. Use `chmod 600` on token files to restrict access
-
 ## License
 
 MIT
