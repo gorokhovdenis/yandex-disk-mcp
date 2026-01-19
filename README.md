@@ -58,14 +58,15 @@ npm install -g yandex-disk-mcp
 
 ## Configuration
 
-Add to your Claude Code MCP settings (`~/.claude/mcp_settings.json`):
+Add to your Claude Code configuration file (`~/.claude.json`):
 
 ```json
 {
   "mcpServers": {
     "yandex-disk": {
+      "type": "stdio",
       "command": "node",
-      "args": ["/Users/denisgorokhov/code/github/yandex-disk-mcp/dist/index.js"],
+      "args": ["/path/to/yandex-disk-mcp/dist/index.js"],
       "env": {
         "YANDEX_DISK_TOKEN": "your_oauth_token_here"
       }
@@ -73,6 +74,8 @@ Add to your Claude Code MCP settings (`~/.claude/mcp_settings.json`):
   }
 }
 ```
+
+**Note:** Replace `/path/to/yandex-disk-mcp` with the actual path where you cloned the repository.
 
 **Security Note:** For better security, store the token in a separate file:
 
@@ -88,10 +91,11 @@ Then use it in config:
 {
   "mcpServers": {
     "yandex-disk": {
+      "type": "stdio",
       "command": "sh",
       "args": [
         "-c",
-        "YANDEX_DISK_TOKEN=$(cat ~/.yandex_disk_token) node /Users/denisgorokhov/code/github/yandex-disk-mcp/dist/index.js"
+        "YANDEX_DISK_TOKEN=$(cat ~/.yandex_disk_token) node /path/to/yandex-disk-mcp/dist/index.js"
       ]
     }
   }
