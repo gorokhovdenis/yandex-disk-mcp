@@ -40,20 +40,19 @@ This MCP server provides tools to interact with Yandex.Disk:
 
 ## Installation
 
-### Option 1: Install from GitHub
+### Option 1: Install from npm (recommended)
 
 ```bash
-cd /Users/denisgorokhov/code/github
+npm install -g yandex-disk-mcp
+```
+
+### Option 2: Install from GitHub
+
+```bash
 git clone https://github.com/gorokhovdenis/yandex-disk-mcp.git
 cd yandex-disk-mcp
 npm install
 npm run build
-```
-
-### Option 2: Install from npm (when published)
-
-```bash
-npm install -g yandex-disk-mcp
 ```
 
 ## Configuration
