@@ -1,0 +1,33 @@
+{
+  "name": "yandex-disk-mcp",
+  "version": "0.1.0",
+  "description": "MCP Server for Yandex.Disk REST API integration with Claude",
+  "main": "dist/index.js",
+  "type": "module",
+  "bin": {
+    "yandex-disk-mcp": "./dist/index.js"
+  },
+  "scripts": {
+    "build": "tsc",
+    "prepare": "npm run build",
+    "watch": "tsc --watch",
+    "dev": "node --loader ts-node/esm src/index.ts"
+  },
+  "keywords": [
+    "mcp",
+    "yandex",
+    "disk",
+    "claude",
+    "ai"
+  ],
+  "author": "Denis Gorokhov <gorokhovdenis@protonmail.com>",
+  "license": "MIT",
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.0.4"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.2",
+    "ts-node": "^10.9.2",
+    "typescript": "^5.7.2"
+  }
+}
