@@ -76,31 +76,6 @@ Add to your Claude Code configuration file (`~/.claude.json`):
 
 **Note:** Replace `/path/to/yandex-disk-mcp` with the actual path where you cloned the repository.
 
-**Security Note:** For better security, store the token in a separate file:
-
-```bash
-# Create a secure token file
-echo "your_oauth_token_here" > ~/.yandex_disk_token
-chmod 600 ~/.yandex_disk_token
-```
-
-Then use it in config:
-
-```json
-{
-  "mcpServers": {
-    "yandex-disk": {
-      "type": "stdio",
-      "command": "sh",
-      "args": [
-        "-c",
-        "YANDEX_DISK_TOKEN=$(cat ~/.yandex_disk_token) node /path/to/yandex-disk-mcp/dist/index.js"
-      ]
-    }
-  }
-}
-```
-
 ## Available Tools
 
 ### yandex_disk_info
