@@ -5,20 +5,38 @@
   "main": "dist/index.js",
   "type": "module",
   "bin": {
-    "yandex-disk-mcp": "./dist/index.js"
+    "yandex-disk-mcp": "dist/index.js"
   },
+  "files": [
+    "dist",
+    "README.md",
+    "LICENSE"
+  ],
   "scripts": {
     "build": "tsc",
     "prepare": "npm run build",
     "watch": "tsc --watch",
     "dev": "node --loader ts-node/esm src/index.ts"
   },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/gorokhovdenis/yandex-disk-mcp.git"
+  },
+  "homepage": "https://github.com/gorokhovdenis/yandex-disk-mcp#readme",
+  "bugs": {
+    "url": "https://github.com/gorokhovdenis/yandex-disk-mcp/issues"
+  },
   "keywords": [
     "mcp",
     "yandex",
+    "yandex-disk",
     "disk",
     "claude",
-    "ai"
+    "claude-code",
+    "ai",
+    "model-context-protocol",
+    "storage",
+    "cloud-storage"
   ],
   "author": "Denis Gorokhov <gorokhovdenis@protonmail.com>",
   "license": "MIT",
