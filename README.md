@@ -8,7 +8,8 @@ This MCP server provides tools to interact with Yandex.Disk:
 
 - 📊 Get disk information (total/used space)
 - 📁 List files and folders
-- 📄 Get file/folder metadata
+- 📄 Get file/folder metadata (with pagination for large folders)
+- 🔍 Compare a local folder with a Yandex.Disk folder (recursive, by size and optionally MD5)
 - ➕ Create folders
 - ⬆️ Upload files (get upload URL)
 - ⬇️ Download files (get download URL)
@@ -101,14 +102,36 @@ Claude, list 50 files from my Yandex.Disk
 ```
 
 ### yandex_disk_get_metadata
-Get metadata for a specific file or folder
+Get metadata for a specific file or folder. For a folder, `_embedded.items` holds one page of its contents and `_embedded.total` the full count.
 
 **Parameters:**
 - `path` (string, required): Path to the file or folder (e.g., '/Documents/file.txt')
+- `limit` (number, optional): Folder items per page (default: 20)
+- `offset` (number, optional): Offset in the folder listing (default: 0)
 
 **Example:**
 ```
 Claude, get metadata for /Documents/report.pdf on Yandex.Disk
+```
+
+### yandex_disk_compare
+Recursively compare a local folder with a folder on Yandex.Disk — e.g. to check that a backup on an external drive matches the cloud copy.
+
+Files are matched by relative path and size, optionally by MD5. Paths are Unicode-normalized (NFC), so names with letters like «й»/«ё» coming from macOS still match. Remote folders are listed in parallel with retries on 429/5xx.
+
+**Parameters:**
+- `remote_path` (string, required): Folder on Yandex.Disk (e.g., '/Backups/Photos')
+- `local_path` (string, required): Absolute path to the local folder (e.g., '/Volumes/USB/Photos')
+- `check_md5` (boolean, optional): Also compare MD5 of files with equal size. Reads every such local file, so it is slow for large folders (default: false)
+- `ignore` (string[], optional): File/folder name globs skipped on both sides (default: `['.DS_Store', '._*']`)
+- `max_items` (number, optional): Max entries per list in the response (default: 100)
+- `output_file` (string, optional): Local path to write the full, untruncated JSON report
+
+**Returns:** totals for both sides, counts of `matching` / `only_local` / `only_remote` / `size_mismatch` / `md5_mismatch` / `case_mismatch` (same name differing only by letter case), differences grouped by top-level folder, and the lists themselves (capped by `max_items`, see `truncated`).
+
+**Example:**
+```
+Claude, compare /Volumes/USB/Photos with /Photos on Yandex.Disk
 ```
 
 ### yandex_disk_create_folder
@@ -217,6 +240,11 @@ Once configured, you can use natural language with Claude:
 4. **Backup files:**
    ```
    "Copy all .md files from current directory to /Backups on Yandex.Disk"
+   ```
+
+5. **Verify a backup:**
+   ```
+   "Compare /Volumes/USB/Archive with /Archive on Yandex.Disk and tell me what is missing in the cloud"
    ```
 
 ## Development
