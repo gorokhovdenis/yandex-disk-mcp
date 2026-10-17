@@ -159,6 +159,7 @@ The upload runs as a background job inside the MCP server, so multi-gigabyte upl
 - Missing destination folders are created.
 - Every uploaded file is verified against the local MD5.
 - **Video is uploaded under a temporary `.part` name and renamed afterwards.** Yandex.Disk throttles API uploads of video files to ~130 KB/s, judging by the extension of the target path; the same bytes under another name go at full speed. The renamed file keeps its MD5 and is recognized as a video, with its EXIF date. A leftover `.part` of the same size from an interrupted run is just renamed.
+- **Before the rename the tool waits for Yandex.Disk to process the file** (up to 60 s, usually a few seconds). The disk builds the preview and reads the capture date asynchronously after the upload and writes the result by path. Renaming earlier sends the result to the old path: a ghost `.part` comes back there, and the renamed file has no date, so it lands in the wrong place in the Photos timeline. If neither a preview nor a date shows up in 60 s, the file is renamed anyway and the log line says so.
 - The job lives in the server process: if the MCP client restarts the server, the job stops. Re-run the same call to continue.
 
 **Parameters:**

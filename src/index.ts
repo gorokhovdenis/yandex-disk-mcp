@@ -140,18 +140,25 @@ class YandexDiskAPI {
     const link = await this.moveResource(from, to, overwrite);
     if (typeof link?.href !== "string" || !link.href.includes("/operations/")) return;
     const op = new URL(link.href);
-    const opPath = op.pathname.replace(/^\/v1\/disk/, "") + op.search;
-    for (let i = 0; i < 120; i++) {
-      const { status } = await this.request(opPath);
+    await this.waitOperation(op.pathname.replace(/^\/v1\/disk/, "") + op.search, `move ${from} -> ${to}`);
+  }
+
+  async waitOperation(opPath: string, what: string, timeoutSeconds = 120) {
+    for (let i = 0; i < timeoutSeconds; i++) {
+      const { status } = await withRetry(() => this.request(opPath));
       if (status === "success") return;
-      if (status === "failed") throw new Error(`move ${from} -> ${to} failed`);
+      if (status === "failed") throw new Error(`${what} failed`);
       await sleep(1000);
     }
-    throw new Error(`move ${from} -> ${to} did not finish in 2 minutes`);
+    throw new Error(`${what} did not finish in ${timeoutSeconds} s`);
   }
 
   async statFile(path: string): Promise<{ size: number; md5?: string }> {
     return this.request(`/resources?path=${encodeURIComponent(path)}&fields=size,md5`);
+  }
+
+  async statMedia(path: string): Promise<{ preview?: string; photoslice_time?: string }> {
+    return this.request(`/resources?path=${encodeURIComponent(path)}&fields=preview,photoslice_time`);
   }
 
   async getLastUploaded(limit: number = 10) {
@@ -490,6 +497,13 @@ const UPLOAD_ATTEMPTS = 3;
 const UPLOAD_IDLE_TIMEOUT_MS = 120_000;
 // A freshly uploaded file can take a few seconds to show up for move/stat.
 const SETTLE_STATUSES = [404, 423];
+// Yandex.Disk extracts the EXIF date and builds the preview of an uploaded
+// file asynchronously, a few seconds after the upload operation succeeds, and
+// writes the result by path. Renaming the .part before that loses the race:
+// the result lands on the old path, which comes back as a ghost .part, and the
+// renamed file is left without its date (no place in the Photos timeline).
+// So the rename waits until the .part shows a preview or a date.
+const MEDIA_PROCESSING_TIMEOUT_MS = 60_000;
 
 type UploadMode = "direct" | "part" | "resume";
 type ItemStatus = "pending" | "uploading" | "done" | "skipped" | "failed" | "cancelled";
@@ -502,7 +516,7 @@ interface UploadItem {
   mode: UploadMode;
   status: ItemStatus;
   sent: number;
-  phase?: "hashing" | "sending" | "renaming" | "verifying";
+  phase?: "hashing" | "sending" | "processing" | "renaming" | "verifying";
   partMd5?: string;
   note?: string;
   error?: string;
@@ -772,13 +786,13 @@ async function uploadWithRetry(
   target: string,
   overwrite: boolean,
   proxy: URL | undefined
-): Promise<string> {
+): Promise<{ md5: string; operationId?: string }> {
   for (let attempt = 1; ; attempt++) {
     item.sent = 0;
     item.phase = "sending";
     try {
       // Upload URLs expire, so every attempt asks for a fresh one.
-      const { href } = await withRetry(() => api.getUploadUrl(target, overwrite));
+      const { href, operation_id } = await withRetry(() => api.getUploadUrl(target, overwrite));
       const res = await putFile(
         href,
         item.absPath,
@@ -790,7 +804,7 @@ async function uploadWithRetry(
         },
         job.abort.signal
       );
-      if (res.status === 201 || res.status === 202) return res.md5;
+      if (res.status === 201 || res.status === 202) return { md5: res.md5, operationId: operation_id };
       throw new YandexDiskApiError(res.status, `upload failed: HTTP ${res.status} ${res.body.slice(0, 300)}`);
     } catch (error) {
       const permanent =
@@ -801,21 +815,51 @@ async function uploadWithRetry(
   }
 }
 
+// Not tied to the job's abort signal: a cancelled job still lets files that
+// are already uploaded finish their rename instead of leaving a .part behind.
+async function waitMediaProcessed(api: YandexDiskAPI, path: string): Promise<boolean> {
+  const deadline = Date.now() + MEDIA_PROCESSING_TIMEOUT_MS;
+  for (;;) {
+    const media = await withRetry(() => api.statMedia(path), 7, SETTLE_STATUSES);
+    if (media.preview || media.photoslice_time) return true;
+    if (Date.now() >= deadline) return false;
+    await sleep(1000);
+  }
+}
+
 async function uploadItem(api: YandexDiskAPI, job: UploadJob, item: UploadItem, opts: UploadOptions) {
   const temp = item.remote + UPLOAD_TEMP_SUFFIX;
   let md5: string | undefined;
+  let processed = "";
   if (item.mode === "resume") {
     item.phase = "hashing";
     md5 = await md5File(item.absPath);
     if (item.partMd5 && item.partMd5 !== md5) item.mode = "part";
   }
+  let operationId: string | undefined;
   if (item.mode !== "resume") {
     const target = item.mode === "part" ? temp : item.remote;
-    md5 = await uploadWithRetry(api, job, item, target, item.mode === "part" || opts.overwrite, opts.proxy);
+    const upload = await uploadWithRetry(api, job, item, target, item.mode === "part" || opts.overwrite, opts.proxy);
+    md5 = upload.md5;
+    operationId = upload.operationId;
   }
   if (item.mode !== "direct") {
+    item.phase = "processing";
+    const started = Date.now();
+    if (operationId) await api.waitOperation(`/operations/${operationId}`, `upload of ${temp}`, 300);
+    const ready = await waitMediaProcessed(api, temp);
+    const seconds = ((Date.now() - started) / 1000).toFixed(1);
+    processed = ready
+      ? `, processed in ${seconds}s`
+      : `, no preview or date from Yandex.Disk in ${seconds}s, renamed anyway`;
+
     item.phase = "renaming";
     await withRetry(() => api.moveAndWait(temp, item.remote, opts.overwrite), 7, SETTLE_STATUSES);
+    const ghost = await api.statFile(temp).catch((error) => {
+      if (error instanceof YandexDiskApiError && error.status === 404) return null;
+      throw error;
+    });
+    if (ghost) throw new Error(`${temp} is still on Yandex.Disk after the rename`);
   }
 
   item.phase = "verifying";
@@ -826,7 +870,7 @@ async function uploadItem(api: YandexDiskAPI, job: UploadJob, item: UploadItem, 
   if (stat.md5 && stat.md5 !== md5) {
     throw new Error(`MD5 on Yandex.Disk ${stat.md5} differs from local ${md5}`);
   }
-  item.note = stat.md5 ? "MD5 verified" : "size verified, MD5 not yet available";
+  item.note = (stat.md5 ? "MD5 verified" : "size verified, MD5 not yet available") + processed;
 }
 
 // Appends are chained so lines land in the order they were logged.
@@ -1339,7 +1383,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           {
             checkMd5: args.check_md5 === true,
             ignore: Array.isArray(args.ignore) ? (args.ignore as string[]) : DEFAULT_IGNORE,
-            maxItems: (args.max_items as number) || 100,
+            maxItems: args.max_items !== undefined ? Number(args.max_items) : 100,
             outputFile: args.output_file as string | undefined,
           }
         );
@@ -1425,7 +1469,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       }
 
       case "yandex_disk_upload_status": {
-        const maxItems = (args?.max_items as number) || 50;
+        const maxItems = args?.max_items !== undefined ? Number(args.max_items) : 50;
         if (!args?.job_id) {
           const jobs = [...uploadJobs.values()].map((job) => {
             const { job_id, state, local_path, remote_path, started_at, files } = uploadStatus(job, 0);
