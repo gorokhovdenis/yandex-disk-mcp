@@ -1,5 +1,7 @@
 # Yandex.Disk MCP Server
 
+**English** | [Русский](README.ru.md)
+
 MCP Server for Yandex.Disk REST API integration with Claude and other MCP clients.
 
 ## Features
@@ -11,7 +13,8 @@ This MCP server provides tools to interact with Yandex.Disk:
 - 📄 Get file/folder metadata (with pagination for large folders)
 - 🔍 Compare a local folder with a Yandex.Disk folder (recursive, by size and optionally MD5)
 - ➕ Create folders
-- ⬆️ Upload files (get upload URL)
+- ⬆️ Upload files and folders as a background job (resumable, MD5-verified, fast for video)
+- 🔗 Get an upload URL for your own uploader
 - ⬇️ Download files (get download URL)
 - 🗑️ Delete files/folders
 - 📋 Copy files/folders
@@ -76,6 +79,8 @@ Add to your Claude Code configuration file (`~/.claude.json`):
 ```
 
 **Note:** Replace `/path/to/yandex-disk-mcp` with the actual path where you cloned the repository.
+
+Optional: set `YANDEX_DISK_UPLOAD_PROXY` (e.g. `http://127.0.0.1:8078`) in `env` to send upload traffic of `yandex_disk_upload` through an HTTP proxy. API calls always go direct.
 
 ## Available Tools
 
@@ -145,8 +150,52 @@ Create a new folder
 Claude, create folder /Backups/2026 on Yandex.Disk
 ```
 
+### yandex_disk_upload
+Upload a local file or a whole folder (recursively, keeping its structure) into a folder on Yandex.Disk.
+
+The upload runs as a background job inside the MCP server, so multi-gigabyte uploads don't hit tool-call timeouts: the tool waits `wait_seconds`, then returns a `job_id` with progress. Poll it with `yandex_disk_upload_status`.
+
+- Files that already exist on the disk with the same size are skipped, so re-running the same upload resumes it.
+- Missing destination folders are created.
+- Every uploaded file is verified against the local MD5.
+- **Video is uploaded under a temporary `.part` name and renamed afterwards.** Yandex.Disk throttles API uploads of video files to ~130 KB/s, judging by the extension of the target path; the same bytes under another name go at full speed. The renamed file keeps its MD5 and is recognized as a video, with its EXIF date. A leftover `.part` of the same size from an interrupted run is just renamed.
+- The job lives in the server process: if the MCP client restarts the server, the job stops. Re-run the same call to continue.
+
+**Parameters:**
+- `local_path` (string, required): Absolute path to a local file or folder
+- `remote_path` (string, required): Destination folder on Yandex.Disk (e.g., '/Photo/2017'); created if missing
+- `include` (string[], optional): Upload only these files — paths relative to `local_path` (as in `yandex_disk_compare`'s `only_local`) or absolute
+- `overwrite` (boolean, optional): Replace existing files. When false, an existing file of the same size is skipped and one of a different size is reported as failed (default: false)
+- `ignore` (string[], optional): File/folder name globs skipped when walking a folder (default: `['.DS_Store', '._*']`)
+- `bypass_extensions` (string[], optional): Extensions uploaded via a temporary `.part` name (default: common video formats — mp4, mov, m4v, avi, mkv, 3gp, wmv, webm, mts, m2ts, mpg, mpeg, flv; `[]` disables)
+- `concurrency` (number, optional): Files uploaded in parallel, 1–4 (default: 1)
+- `proxy` (string, optional): HTTP proxy for the upload traffic (e.g., 'http://127.0.0.1:8078'). Default: `YANDEX_DISK_UPLOAD_PROXY`; `''` disables
+- `log_file` (string, optional): Local file to append one line per file to (`OK` / `SKIP` / `FAIL`) — handy for `tail -f`
+- `wait_seconds` (number, optional): Wait up to this long for the job to finish before returning, 0–900 (default: 30)
+
+**Returns:** job status (see below).
+
+**Example:**
+```
+Claude, upload /Volumes/USB/DCIM/Camera to /Photo/2017 on Yandex.Disk
+```
+
+### yandex_disk_upload_status
+Progress of an upload job: file counts (`done` / `skipped` / `failed` / `pending` / ...), bytes, average speed, ETA, files in flight and the errors of failed ones. Without `job_id` it lists all jobs of the server process.
+
+**Parameters:**
+- `job_id` (string, optional): Job id returned by `yandex_disk_upload`
+- `wait_seconds` (number, optional): Wait up to this long for the job to finish before returning, 0–900 (default: 0)
+- `max_items` (number, optional): Max entries per list in the response (default: 50)
+
+### yandex_disk_upload_cancel
+Cancel an upload job. Files in flight are aborted — an incomplete upload leaves nothing on the disk; finished files stay.
+
+**Parameters:**
+- `job_id` (string, required): Job id returned by `yandex_disk_upload`
+
 ### yandex_disk_get_upload_url
-Get URL for uploading a file
+Get URL for uploading a file with your own client (curl, etc.). For most cases `yandex_disk_upload` is simpler
 
 **Parameters:**
 - `path` (string, required): Path where to upload the file
@@ -226,11 +275,10 @@ Once configured, you can use natural language with Claude:
    "Show me how much space I have on Yandex.Disk"
    ```
 
-2. **Upload a file:**
+2. **Upload files:**
    ```
-   "Upload this file to /Documents/report.pdf on Yandex.Disk"
+   "Upload /Users/me/Desktop/report.pdf to /Documents on Yandex.Disk"
    ```
-   (Claude will get the upload URL, then you can use curl or other tools to actually upload)
 
 3. **Organize files:**
    ```
@@ -246,6 +294,12 @@ Once configured, you can use natural language with Claude:
    ```
    "Compare /Volumes/USB/Archive with /Archive on Yandex.Disk and tell me what is missing in the cloud"
    ```
+
+6. **Fill the gaps:**
+   ```
+   "Upload the files that are only local to /Archive"
+   ```
+   (Claude passes `only_local` from the comparison as `include` to `yandex_disk_upload`)
 
 ## Development
 
