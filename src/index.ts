@@ -9,7 +9,7 @@ import {
   McpError,
 } from "@modelcontextprotocol/sdk/types.js";
 import { createHash } from "node:crypto";
-import { createReadStream, promises as fs } from "node:fs";
+import { createReadStream, createWriteStream, promises as fs } from "node:fs";
 import * as http from "node:http";
 import * as https from "node:https";
 import * as nodePath from "node:path";
@@ -87,6 +87,7 @@ class YandexDiskAPI {
       "_embedded.items.type",
       "_embedded.items.size",
       "_embedded.items.md5",
+      "_embedded.items.modified",
       "_embedded.total",
     ].join(",");
     return this.request(
@@ -161,6 +162,19 @@ class YandexDiskAPI {
     return this.request(`/resources?path=${encodeURIComponent(path)}&fields=preview,photoslice_time`);
   }
 
+  async statItem(path: string): Promise<{
+    name: string;
+    path: string;
+    type: "dir" | "file";
+    size?: number;
+    md5?: string;
+    modified?: string;
+  }> {
+    return this.request(
+      `/resources?path=${encodeURIComponent(path)}&fields=name,path,type,size,md5,modified`
+    );
+  }
+
   async getLastUploaded(limit: number = 10) {
     return this.request(`/resources/last-uploaded?limit=${limit}`);
   }
@@ -175,6 +189,8 @@ interface FileEntry {
   size: number;
   md5?: string;
   absPath?: string;
+  remotePath?: string;
+  modified?: string;
 }
 
 interface TreeListing {
@@ -269,7 +285,12 @@ async function walkRemote(
             if (item.type === "dir") {
               pending.push({ path: item.path, rel });
             } else {
-              files.set(nfc(rel), { size: item.size ?? 0, md5: item.md5 });
+              files.set(nfc(rel), {
+                size: item.size ?? 0,
+                md5: item.md5,
+                remotePath: item.path,
+                modified: item.modified,
+              });
             }
           }
           inFlight--;
@@ -598,6 +619,12 @@ function openTunnel(proxy: URL, host: string, port: number): Promise<tls.TLSSock
   });
 }
 
+// Request options that send an https request over an opened tunnel. Without an
+// agent Node assumes port 80 and sends "Host: <name>:80"; the upload servers
+// tolerate it, the download servers answer 404.
+const viaTunnel = (tunnel: tls.TLSSocket | undefined) =>
+  tunnel ? { createConnection: () => tunnel, defaultPort: 443 } : {};
+
 // Streams a local file to an upload URL; returns the HTTP status and the MD5
 // of the bytes sent.
 async function putFile(
@@ -617,7 +644,7 @@ async function putFile(
       method: "PUT",
       headers: { "Content-Length": size },
       signal,
-      ...(tunnel ? { createConnection: () => tunnel } : {}),
+      ...viaTunnel(tunnel),
     });
     req.setTimeout(UPLOAD_IDLE_TIMEOUT_MS, () => req.destroy(new Error("upload stalled")));
     req.on("error", reject);
@@ -874,7 +901,7 @@ async function uploadItem(api: YandexDiskAPI, job: UploadJob, item: UploadItem, 
 }
 
 // Appends are chained so lines land in the order they were logged.
-function logUpload(job: UploadJob, line: string) {
+function logJob(job: { logFile?: string; logChain: Promise<void> }, line: string) {
   if (!job.logFile) return;
   const text = `${new Date().toISOString()} ${line}\n`;
   job.logChain = job.logChain.then(() => fs.appendFile(job.logFile!, text)).catch(() => {});
@@ -882,10 +909,10 @@ function logUpload(job: UploadJob, line: string) {
 
 async function runUpload(api: YandexDiskAPI, job: UploadJob, opts: UploadOptions) {
   const queue = job.items.filter((i) => i.status === "pending");
-  logUpload(job, `JOB  ${job.id} ${job.localPath} -> ${job.remotePath}: ${queue.length} to upload`);
+  logJob(job, `JOB  ${job.id} ${job.localPath} -> ${job.remotePath}: ${queue.length} to upload`);
   for (const item of job.items) {
-    if (item.status === "skipped") logUpload(job, `SKIP ${item.rel} (${item.note})`);
-    if (item.status === "failed") logUpload(job, `FAIL ${item.rel} ${item.error}`);
+    if (item.status === "skipped") logJob(job, `SKIP ${item.rel} (${item.note})`);
+    if (item.status === "failed") logJob(job, `FAIL ${item.rel} ${item.error}`);
   }
 
   const worker = async () => {
@@ -897,14 +924,14 @@ async function runUpload(api: YandexDiskAPI, job: UploadJob, opts: UploadOptions
         item.status = "done";
         const seconds = (Date.now() - started) / 1000;
         const speed = item.mode === "resume" ? "" : ` ${(item.size / seconds / 1e6).toFixed(1)}MB/s`;
-        logUpload(job, `OK   ${item.rel} ${item.size} ${seconds.toFixed(1)}s${speed} ${item.mode}, ${item.note}`);
+        logJob(job, `OK   ${item.rel} ${item.size} ${seconds.toFixed(1)}s${speed} ${item.mode}, ${item.note}`);
       } catch (error) {
         if (job.abort.signal.aborted) {
           item.status = "cancelled";
         } else {
           item.status = "failed";
           item.error = error instanceof Error ? error.message : String(error);
-          logUpload(job, `FAIL ${item.rel} ${item.error}`);
+          logJob(job, `FAIL ${item.rel} ${item.error}`);
         }
       }
     }
@@ -915,7 +942,7 @@ async function runUpload(api: YandexDiskAPI, job: UploadJob, opts: UploadOptions
   job.state = job.abort.signal.aborted ? "cancelled" : "done";
   job.finishedAt = Date.now();
   const failed = job.items.filter((i) => i.status === "failed").length;
-  logUpload(job, `JOB  ${job.id} ${job.state}, failed: ${failed}`);
+  logJob(job, `JOB  ${job.id} ${job.state}, failed: ${failed}`);
   await job.logChain;
 }
 
@@ -966,14 +993,343 @@ function uploadStatus(job: UploadJob, maxItems: number) {
   };
 }
 
-async function waitForJob(job: UploadJob, seconds: number) {
+async function waitForJob(job: { finished: Promise<void> }, seconds: number) {
   if (seconds > 0) await Promise.race([job.finished, sleep(seconds * 1000)]);
+}
+
+// ---------- Download: Yandex.Disk file or folder -> local folder ----------
+
+// A file is written as "<name>.part" and renamed only after its size and MD5
+// match Yandex.Disk, so an interrupted download never passes for a complete one.
+const DOWNLOAD_TEMP_SUFFIX = ".part";
+const DOWNLOAD_ATTEMPTS = 3;
+// Some storage hosts accept the request for a file and never send a byte, while
+// files on other hosts arrive within a second. Waiting longer does not help, so
+// a silent connection is dropped early and the next attempt asks for a new link.
+const DOWNLOAD_IDLE_TIMEOUT_MS = 30_000;
+const DOWNLOAD_MAX_REDIRECTS = 5;
+
+type DownloadItemStatus = "pending" | "downloading" | "done" | "skipped" | "failed" | "cancelled";
+
+interface DownloadItem {
+  rel: string;
+  remote: string;
+  absPath: string;
+  size: number;
+  md5?: string;
+  modified?: string;
+  status: DownloadItemStatus;
+  received: number;
+  note?: string;
+  error?: string;
+}
+
+interface DownloadOptions {
+  overwrite: boolean;
+  ignore: string[];
+  concurrency: number;
+  proxy?: URL;
+  logFile?: string;
+}
+
+interface DownloadJob {
+  id: string;
+  remotePath: string;
+  localPath: string;
+  items: DownloadItem[];
+  errors: string[];
+  state: "running" | "done" | "cancelled";
+  startedAt: number;
+  finishedAt?: number;
+  transferred: number;
+  abort: AbortController;
+  finished: Promise<void>;
+  logFile?: string;
+  logChain: Promise<void>;
+}
+
+const downloadJobs = new Map<string, DownloadJob>();
+let downloadJobCounter = 0;
+
+// Free bytes on the volume holding `path`, which may not exist yet.
+async function freeSpace(path: string): Promise<number> {
+  for (let dir = path; ; dir = nodePath.dirname(dir)) {
+    try {
+      const st = await fs.statfs(dir);
+      return st.bavail * st.bsize;
+    } catch (error) {
+      const missing = (error as NodeJS.ErrnoException).code === "ENOENT";
+      if (!missing || dir === nodePath.dirname(dir)) throw error;
+    }
+  }
+}
+
+// Streams a download link into destPath and returns the MD5 of the bytes
+// written. The link answers 302 to a storage host; every hop gets its own
+// proxy tunnel, since a tunnel is bound to one host.
+async function getFile(
+  href: string,
+  destPath: string,
+  proxy: URL | undefined,
+  onBytes: (n: number) => void,
+  signal: AbortSignal
+): Promise<string> {
+  let url = new URL(href);
+  for (let hop = 0; ; hop++) {
+    const tunnel = proxy ? await openTunnel(proxy, url.hostname, Number(url.port) || 443) : undefined;
+    try {
+      const host = url.hostname;
+      const res = await new Promise<http.IncomingMessage>((resolve, reject) => {
+        const req = https.request(url, {
+          signal,
+          ...viaTunnel(tunnel),
+        });
+        req.setTimeout(DOWNLOAD_IDLE_TIMEOUT_MS, () =>
+          req.destroy(new Error(`no data from ${host} for ${DOWNLOAD_IDLE_TIMEOUT_MS / 1000} s`))
+        );
+        req.on("error", reject);
+        req.on("response", resolve);
+        req.end();
+      });
+      const status = res.statusCode ?? 0;
+      const location = res.headers.location;
+      if (status >= 300 && status < 400 && location && hop < DOWNLOAD_MAX_REDIRECTS) {
+        res.resume();
+        url = new URL(location, url);
+        continue;
+      }
+      if (status !== 200) {
+        res.resume();
+        throw new Error(`download failed: HTTP ${status}`);
+      }
+
+      const hash = createHash("md5");
+      const counter = new Transform({
+        transform(chunk, _encoding, callback) {
+          hash.update(chunk);
+          onBytes(chunk.length);
+          callback(null, chunk);
+        },
+      });
+      await new Promise<void>((resolve, reject) =>
+        pipeline(res, counter, createWriteStream(destPath), (error) => (error ? reject(error) : resolve()))
+      );
+      return hash.digest("hex");
+    } finally {
+      tunnel?.destroy();
+    }
+  }
+}
+
+async function planDownload(
+  api: YandexDiskAPI,
+  remotePath: string,
+  localPath: string,
+  opts: DownloadOptions
+): Promise<DownloadJob> {
+  const remoteRoot = normalizeRemoteRoot(remotePath);
+  const localRoot = nodePath.resolve(localPath);
+  const root = await withRetry(() => api.statItem(remoteRoot));
+  const remote =
+    root.type === "dir"
+      ? (await walkRemote(api, remoteRoot, opts.ignore.map(globToRegExp))).files
+      : new Map<string, FileEntry>([
+          [
+            nfc(root.name),
+            { size: root.size ?? 0, md5: root.md5, remotePath: root.path, modified: root.modified },
+          ],
+        ]);
+
+  const items: DownloadItem[] = [...remote]
+    .sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0))
+    .map(([rel, f]) => ({
+      rel,
+      remote: (f.remotePath ?? joinRemote(remoteRoot, rel)).replace(/^disk:/, ""),
+      absPath: nodePath.join(localRoot, rel),
+      size: f.size,
+      md5: f.md5,
+      modified: f.modified,
+      status: "pending",
+      received: 0,
+    }));
+
+  await Promise.all(
+    items.map(async (item) => {
+      const st = await fs.stat(item.absPath).catch(() => null);
+      if (!st || opts.overwrite) return;
+      if (st.size === item.size) {
+        item.status = "skipped";
+        item.note = "already on the local disk with the same size";
+      } else {
+        item.status = "failed";
+        item.error = `already on the local disk with a different size (${st.size} bytes); pass overwrite=true to replace it`;
+      }
+    })
+  );
+
+  const needed = items.filter((i) => i.status === "pending").reduce((sum, i) => sum + i.size, 0);
+  const free = await freeSpace(localRoot);
+  if (needed > free) {
+    throw new McpError(
+      ErrorCode.InvalidParams,
+      `Not enough space for ${remoteRoot} in ${localRoot}: ${needed} bytes to download, ${free} free`
+    );
+  }
+
+  return {
+    id: `download-${++downloadJobCounter}`,
+    remotePath: remoteRoot,
+    localPath: localRoot,
+    items,
+    errors: [],
+    state: "running",
+    startedAt: Date.now(),
+    transferred: 0,
+    abort: new AbortController(),
+    finished: Promise.resolve(),
+    logFile: opts.logFile,
+    logChain: Promise.resolve(),
+  };
+}
+
+async function downloadItem(
+  api: YandexDiskAPI,
+  job: DownloadJob,
+  item: DownloadItem,
+  opts: DownloadOptions
+) {
+  const temp = item.absPath + DOWNLOAD_TEMP_SUFFIX;
+  await fs.mkdir(nodePath.dirname(item.absPath), { recursive: true });
+  let md5 = "";
+  for (let attempt = 1; ; attempt++) {
+    item.received = 0;
+    try {
+      // Download links expire, so every attempt asks for a fresh one.
+      const { href } = await withRetry(() => api.getDownloadUrl(item.remote));
+      md5 = await getFile(
+        href,
+        temp,
+        opts.proxy,
+        (n) => {
+          item.received += n;
+          job.transferred += n;
+        },
+        job.abort.signal
+      );
+      break;
+    } catch (error) {
+      // An API 4xx (the file is gone, no access) will not change on retry.
+      const permanent =
+        error instanceof YandexDiskApiError && error.status < 500 && error.status !== 429;
+      if (job.abort.signal.aborted || permanent || attempt >= DOWNLOAD_ATTEMPTS) {
+        await fs.rm(temp, { force: true });
+        throw error;
+      }
+      await sleep(2000 * attempt);
+    }
+  }
+
+  const { size } = await fs.stat(temp);
+  const mismatch =
+    size !== item.size
+      ? `downloaded ${size} bytes, Yandex.Disk has ${item.size}`
+      : item.md5 && item.md5 !== md5
+        ? `MD5 ${md5} differs from Yandex.Disk ${item.md5}`
+        : undefined;
+  if (mismatch) {
+    await fs.rm(temp, { force: true });
+    throw new Error(mismatch);
+  }
+  await fs.rename(temp, item.absPath);
+  // The copy keeps the Yandex.Disk modification time, so it sorts by date like the original.
+  if (item.modified) {
+    const time = new Date(item.modified);
+    await fs.utimes(item.absPath, time, time);
+  }
+  item.note = item.md5 ? "MD5 verified" : "size verified, no MD5 on Yandex.Disk";
+}
+
+async function runDownload(api: YandexDiskAPI, job: DownloadJob, opts: DownloadOptions) {
+  const queue = job.items.filter((i) => i.status === "pending");
+  logJob(job, `JOB  ${job.id} ${job.remotePath} -> ${job.localPath}: ${queue.length} to download`);
+  for (const item of job.items) {
+    if (item.status === "skipped") logJob(job, `SKIP ${item.rel} (${item.note})`);
+    if (item.status === "failed") logJob(job, `FAIL ${item.rel} ${item.error}`);
+  }
+
+  const worker = async () => {
+    for (let item = queue.shift(); item && !job.abort.signal.aborted; item = queue.shift()) {
+      const started = Date.now();
+      item.status = "downloading";
+      try {
+        await downloadItem(api, job, item, opts);
+        item.status = "done";
+        const seconds = (Date.now() - started) / 1000;
+        const speed = (item.size / Math.max(seconds, 0.001) / 1e6).toFixed(1);
+        logJob(job, `OK   ${item.rel} ${item.size} ${seconds.toFixed(1)}s ${speed}MB/s, ${item.note}`);
+      } catch (error) {
+        if (job.abort.signal.aborted) {
+          item.status = "cancelled";
+        } else {
+          item.status = "failed";
+          item.error = error instanceof Error ? error.message : String(error);
+          logJob(job, `FAIL ${item.rel} ${item.error}`);
+        }
+      }
+    }
+  };
+  await Promise.all(Array.from({ length: opts.concurrency }, worker));
+
+  for (const item of job.items) if (item.status === "pending") item.status = "cancelled";
+  job.state = job.abort.signal.aborted ? "cancelled" : "done";
+  job.finishedAt = Date.now();
+  const failed = job.items.filter((i) => i.status === "failed").length;
+  logJob(job, `JOB  ${job.id} ${job.state}, failed: ${failed}`);
+  await job.logChain;
+}
+
+function downloadStatus(job: DownloadJob, maxItems: number) {
+  const by = (s: DownloadItemStatus) => job.items.filter((i) => i.status === s);
+  const left = job.items.filter((i) => i.status === "pending" || i.status === "downloading");
+  const bytesLeft = left.reduce((sum, i) => sum + i.size - i.received, 0);
+  const elapsed = ((job.finishedAt ?? Date.now()) - job.startedAt) / 1000;
+  const speed = elapsed > 0 ? job.transferred / elapsed : 0;
+  const cap = <T>(list: T[]) => list.slice(0, maxItems);
+  return {
+    job_id: job.id,
+    state: job.state,
+    remote_path: job.remotePath,
+    local_path: job.localPath,
+    started_at: new Date(job.startedAt).toISOString(),
+    finished_at: job.finishedAt ? new Date(job.finishedAt).toISOString() : null,
+    elapsed_seconds: Math.round(elapsed),
+    files: {
+      total: job.items.length,
+      done: by("done").length,
+      skipped: by("skipped").length,
+      failed: by("failed").length,
+      cancelled: by("cancelled").length,
+      pending: by("pending").length,
+      downloading: by("downloading").length,
+    },
+    bytes: {
+      total: job.items.reduce((sum, i) => sum + i.size, 0),
+      transferred: job.transferred,
+      left: bytesLeft,
+    },
+    speed_bytes_per_second: Math.round(speed),
+    eta_seconds: job.state === "running" && speed > 0 ? Math.round(bytesLeft / speed) : null,
+    downloading: by("downloading").map((i) => ({ path: i.rel, received: i.received, size: i.size })),
+    failed: cap(by("failed").map((i) => ({ path: i.rel, error: i.error }))),
+    errors: cap(job.errors),
+    log_file: job.logFile ?? null,
+  };
 }
 
 const server = new Server(
   {
     name: "yandex-disk-mcp",
-    version: "0.3.0",
+    version: "0.4.0",
   },
   {
     capabilities: {
@@ -1217,6 +1573,98 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
             job_id: {
               type: "string",
               description: "Job id returned by yandex_disk_upload",
+            },
+          },
+          required: ["job_id"],
+        },
+      },
+      {
+        name: "yandex_disk_download",
+        description:
+          "Download a Yandex.Disk file or folder (recursively, keeping its structure) into a local folder. Runs as a background job: returns a job_id and progress after wait_seconds; poll it with yandex_disk_download_status. Files already on the local disk with the same size are skipped, missing folders are created, every file is verified by MD5 and keeps its Yandex.Disk modification time. A file is written as '<name>.part' and renamed once verified. The job refuses to start if the local volume lacks space. The job lives in the MCP server process and stops if the server exits",
+        inputSchema: {
+          type: "object",
+          properties: {
+            remote_path: {
+              type: "string",
+              description: "File or folder on Yandex.Disk (e.g., '/Photo/2004')",
+            },
+            local_path: {
+              type: "string",
+              description:
+                "Absolute local folder that receives the contents of remote_path (e.g., '/Volumes/Backup/Photo/2004'); created if missing",
+            },
+            overwrite: {
+              type: "boolean",
+              description:
+                "Replace local files. When false, a local file of the same size is skipped and one of a different size is reported as failed (default: false)",
+              default: false,
+            },
+            ignore: {
+              type: "array",
+              items: { type: "string" },
+              description:
+                "File/folder name globs skipped when walking the remote folder (default: ['.DS_Store', '._*'])",
+            },
+            concurrency: {
+              type: "number",
+              description: "Files downloaded in parallel, 1-8 (default: 4)",
+              default: 4,
+            },
+            proxy: {
+              type: "string",
+              description:
+                "HTTP proxy for the download traffic (e.g., 'http://127.0.0.1:8078'); API calls go direct. Default: YANDEX_DISK_DOWNLOAD_PROXY env var; '' disables",
+            },
+            log_file: {
+              type: "string",
+              description: "Optional local file to append one line per file (OK/SKIP/FAIL) to",
+            },
+            wait_seconds: {
+              type: "number",
+              description:
+                "Wait up to this many seconds for the job to finish before returning, 0-900 (default: 30)",
+              default: 30,
+            },
+          },
+          required: ["remote_path", "local_path"],
+        },
+      },
+      {
+        name: "yandex_disk_download_status",
+        description:
+          "Progress of a download job started by yandex_disk_download: file counts, bytes, speed, ETA, files in flight and failures. Without job_id lists all jobs of this server process",
+        inputSchema: {
+          type: "object",
+          properties: {
+            job_id: {
+              type: "string",
+              description: "Job id returned by yandex_disk_download",
+            },
+            wait_seconds: {
+              type: "number",
+              description:
+                "Wait up to this many seconds for the job to finish before returning, 0-900 (default: 0)",
+              default: 0,
+            },
+            max_items: {
+              type: "number",
+              description: "Max entries per list in the response (default: 50)",
+              default: 50,
+            },
+          },
+        },
+      },
+      {
+        name: "yandex_disk_download_cancel",
+        description:
+          "Cancel a download job. Files in flight are aborted and their '.part' files removed; finished files stay",
+        inputSchema: {
+          type: "object",
+          properties: {
+            job_id: {
+              type: "string",
+              description: "Job id returned by yandex_disk_download",
             },
           },
           required: ["job_id"],
@@ -1506,6 +1954,87 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
             {
               type: "text",
               text: JSON.stringify(uploadStatus(job, 50), null, 2),
+            },
+          ],
+        };
+      }
+
+      case "yandex_disk_download": {
+        if (!args?.remote_path || !args?.local_path) {
+          throw new McpError(
+            ErrorCode.InvalidParams,
+            "remote_path and local_path are required"
+          );
+        }
+        if (!nodePath.isAbsolute(args.local_path as string)) {
+          throw new McpError(ErrorCode.InvalidParams, "local_path must be absolute");
+        }
+        const opts: DownloadOptions = {
+          overwrite: args.overwrite === true,
+          ignore: Array.isArray(args.ignore) ? (args.ignore as string[]) : DEFAULT_IGNORE,
+          concurrency: Math.min(8, Math.max(1, Math.floor(Number(args.concurrency) || 4))),
+          proxy: parseProxy(
+            args.proxy !== undefined ? (args.proxy as string) : process.env.YANDEX_DISK_DOWNLOAD_PROXY
+          ),
+          logFile: args.log_file as string | undefined,
+        };
+        const job = await planDownload(api, args.remote_path as string, args.local_path as string, opts);
+        downloadJobs.set(job.id, job);
+        job.finished = runDownload(api, job, opts).catch((error) => {
+          job.state = "done";
+          job.finishedAt = Date.now();
+          job.errors.push(`job crashed: ${error instanceof Error ? error.message : String(error)}`);
+        });
+        const wait = args.wait_seconds !== undefined ? Number(args.wait_seconds) : 30;
+        await waitForJob(job, Math.min(900, Math.max(0, wait || 0)));
+        return {
+          content: [
+            {
+              type: "text",
+              text: JSON.stringify(downloadStatus(job, 50), null, 2),
+            },
+          ],
+        };
+      }
+
+      case "yandex_disk_download_status": {
+        const maxItems = args?.max_items !== undefined ? Number(args.max_items) : 50;
+        if (!args?.job_id) {
+          const jobs = [...downloadJobs.values()].map((job) => {
+            const { job_id, state, remote_path, local_path, started_at, files } = downloadStatus(job, 0);
+            return { job_id, state, remote_path, local_path, started_at, files };
+          });
+          return {
+            content: [{ type: "text", text: JSON.stringify(jobs, null, 2) }],
+          };
+        }
+        const job = downloadJobs.get(args.job_id as string);
+        if (!job) {
+          throw new McpError(ErrorCode.InvalidParams, `Unknown download job: ${args.job_id}`);
+        }
+        await waitForJob(job, Math.min(900, Math.max(0, Number(args.wait_seconds) || 0)));
+        return {
+          content: [
+            {
+              type: "text",
+              text: JSON.stringify(downloadStatus(job, maxItems), null, 2),
+            },
+          ],
+        };
+      }
+
+      case "yandex_disk_download_cancel": {
+        const job = args?.job_id ? downloadJobs.get(args.job_id as string) : undefined;
+        if (!job) {
+          throw new McpError(ErrorCode.InvalidParams, `Unknown download job: ${args?.job_id}`);
+        }
+        job.abort.abort();
+        await waitForJob(job, 15);
+        return {
+          content: [
+            {
+              type: "text",
+              text: JSON.stringify(downloadStatus(job, 50), null, 2),
             },
           ],
         };

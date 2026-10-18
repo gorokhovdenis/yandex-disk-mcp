@@ -15,7 +15,8 @@ This MCP server provides tools to interact with Yandex.Disk:
 - ➕ Create folders
 - ⬆️ Upload files and folders as a background job (resumable, MD5-verified, fast for video)
 - 🔗 Get an upload URL for your own uploader
-- ⬇️ Download files (get download URL)
+- ⬇️ Download files and folders to a local disk as a background job (MD5-verified, keeps modification times)
+- 🔗 Get a download URL for your own downloader
 - 🗑️ Delete files/folders
 - 📋 Copy files/folders
 - 🔄 Move/rename files/folders
@@ -80,7 +81,7 @@ Add to your Claude Code configuration file (`~/.claude.json`):
 
 **Note:** Replace `/path/to/yandex-disk-mcp` with the actual path where you cloned the repository.
 
-Optional: set `YANDEX_DISK_UPLOAD_PROXY` (e.g. `http://127.0.0.1:8078`) in `env` to send upload traffic of `yandex_disk_upload` through an HTTP proxy. API calls always go direct.
+Optional: set `YANDEX_DISK_UPLOAD_PROXY` / `YANDEX_DISK_DOWNLOAD_PROXY` (e.g. `http://127.0.0.1:8078`) in `env` to send the traffic of `yandex_disk_upload` / `yandex_disk_download` through an HTTP proxy. API calls always go direct.
 
 ## Available Tools
 
@@ -207,8 +208,52 @@ Get URL for uploading a file with your own client (curl, etc.). For most cases `
 Claude, get upload URL for /Documents/report.pdf on Yandex.Disk
 ```
 
+### yandex_disk_download
+Download a file or a whole folder from Yandex.Disk (recursively, keeping its structure) into a local folder — e.g. for a local backup.
+
+Like the upload, it runs as a background job: the tool waits `wait_seconds`, then returns a `job_id` with progress. Poll it with `yandex_disk_download_status`.
+
+- Files already on the local disk with the same size are skipped, so re-running the same download resumes it.
+- Missing local folders are created.
+- Every file is written as `<name>.part` and renamed only after its size and MD5 match Yandex.Disk, so an interrupted download never passes for a complete one.
+- Downloaded files keep their Yandex.Disk modification time (when the file was uploaded or last changed there, not the capture date).
+- If a storage host sends nothing for 30 s, the attempt is dropped and retried with a fresh link, up to 3 attempts. Yandex.Disk sometimes has a storage host that accepts requests for some files and never answers, while other files come within a second; such files end up in `failed`. Re-run the same download later to fetch them.
+- The job refuses to start if the local volume has less free space than the files to download.
+- Yandex.Disk does not hand out a download link for a folder (the API answers 500), so the tool walks the folder and downloads file by file.
+
+**Parameters:**
+- `remote_path` (string, required): File or folder on Yandex.Disk (e.g., '/Photo/2004')
+- `local_path` (string, required): Absolute local folder that receives the contents of `remote_path` (e.g., '/Volumes/Backup/Photo/2004'); created if missing
+- `overwrite` (boolean, optional): Replace local files. When false, a local file of the same size is skipped and one of a different size is reported as failed (default: false)
+- `ignore` (string[], optional): File/folder name globs skipped when walking the remote folder (default: `['.DS_Store', '._*']`)
+- `concurrency` (number, optional): Files downloaded in parallel, 1–8 (default: 4)
+- `proxy` (string, optional): HTTP proxy for the download traffic (e.g., 'http://127.0.0.1:8078'). Default: `YANDEX_DISK_DOWNLOAD_PROXY`; `''` disables
+- `log_file` (string, optional): Local file to append one line per file to (`OK` / `SKIP` / `FAIL`)
+- `wait_seconds` (number, optional): Wait up to this long for the job to finish before returning, 0–900 (default: 30)
+
+**Returns:** job status, same shape as for the upload.
+
+**Example:**
+```
+Claude, download /Photo from Yandex.Disk to /Volumes/Backup/Photo
+```
+
+### yandex_disk_download_status
+Progress of a download job: file counts, bytes, average speed, ETA, files in flight and the errors of failed ones. Without `job_id` it lists all download jobs of the server process.
+
+**Parameters:**
+- `job_id` (string, optional): Job id returned by `yandex_disk_download`
+- `wait_seconds` (number, optional): Wait up to this long for the job to finish before returning, 0–900 (default: 0)
+- `max_items` (number, optional): Max entries per list in the response (default: 50)
+
+### yandex_disk_download_cancel
+Cancel a download job. Files in flight are aborted and their `.part` files removed; finished files stay.
+
+**Parameters:**
+- `job_id` (string, required): Job id returned by `yandex_disk_download`
+
 ### yandex_disk_get_download_url
-Get URL for downloading a file
+Get URL for downloading a file with your own client. For whole folders `yandex_disk_download` is simpler
 
 **Parameters:**
 - `path` (string, required): Path to the file to download
@@ -301,6 +346,11 @@ Once configured, you can use natural language with Claude:
    "Upload the files that are only local to /Archive"
    ```
    (Claude passes `only_local` from the comparison as `include` to `yandex_disk_upload`)
+
+7. **Local backup:**
+   ```
+   "Download /Photo from Yandex.Disk to /Volumes/Backup/Photo"
+   ```
 
 ## Development
 
